@@ -1,0 +1,6 @@
+[workspace]
+members = [
+  "crates/yx-protocol",
+  "crates/yx-client",
+]
+resolver = "2"
