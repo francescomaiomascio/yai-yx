@@ -1,0 +1,10 @@
+:root {
+  --surface-bg: #0b0f14;
+  --surface-panel: #0f1620;
+  --text-primary: #e6edf3;
+  --text-muted: #9aa4af;
+  --state-ok: #2ecc71;
+  --state-warn: #f1c40f;
+  --state-deny: #e74c3c;
+  --state-info: #3498db;
+}
