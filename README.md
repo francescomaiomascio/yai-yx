@@ -5,13 +5,27 @@ Single Sovereign Interface for YAI.
 ## Scope
 
 YX is the only graphical interface for YAI control-plane operations.
-It connects to `yai` over UDS NDJSON protocol v1.
+It connects to `yai` over UDS.
 
 ## Modes
 
 - `real`: connect to UDS socket (`YX_SOCK`)
 - `mock`: local simulator
 - `auto` (default): fallback to mock when socket is unavailable
+
+## Run
+
+```bash
+cd /Users/francescomaiomascio/Developer/YAI/yai-yx
+make dev
+```
+
+Optional env vars:
+
+```bash
+export YX_MODE=auto   # auto|mock|real
+export YX_SOCK="$HOME/.yai/run/dev/control.sock"
+```
 
 ## DO NOTs
 
