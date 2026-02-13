@@ -7,10 +7,30 @@ function unwrap(response) {
   return response;
 }
 
+function safeStr(v) {
+  if (v == null) return "";
+  const s = String(v);
+  return s.trim();
+}
+
+// arming: solo comandi “dangerous”
+function requiresArming(name) {
+  return (
+    name === "providers.pair" ||
+    name === "providers.attach" ||
+    name === "providers.revoke" ||
+    name === "providers.detach"
+  );
+}
+
+async function run(name, args = {}) {
+  const res = await runCommand(name, args, { arming: requiresArming(name) });
+  return unwrap(res);
+}
+
 export async function providersList() {
   try {
-    const res = await runCommand("providers.list", {});
-    const payload = unwrap(res);
+    const payload = await run("providers.list", {});
     setProviders(payload.items || []);
     return payload;
   } catch (err) {
@@ -19,41 +39,81 @@ export async function providersList() {
   }
 }
 
-export async function providersDiscover(endpoint = null, model = null) {
-  const args = {};
-  if (endpoint) args.endpoint = endpoint;
-  if (model) args.model = model;
-  const res = await runCommand("providers.discover", args);
-  const payload = unwrap(res);
-  setProviders(payload.items || []);
-  return payload;
+export async function providersDiscover(endpoint = "", model = "") {
+  try {
+    // IMPORTANT: mai null → sempre stringhe
+    const args = {
+      endpoint: safeStr(endpoint),
+      model: safeStr(model),
+    };
+
+    const payload = await run("providers.discover", args);
+    setProviders(payload.items || []);
+
+    // refresh active provider (se discover/pair/attach hanno effetti)
+    await providersStatus().catch(() => {});
+
+    return payload;
+  } catch (err) {
+    setProvidersError(String(err));
+    throw err;
+  }
 }
 
 export async function providersStatus() {
-  const res = await runCommand("providers.status", {});
-  const payload = unwrap(res);
-  if (payload.active) setActiveProvider(payload.active);
-  return payload;
+  try {
+    const payload = await run("providers.status", {});
+    setActiveProvider(payload.active || null);
+    return payload;
+  } catch (err) {
+    setProvidersError(String(err));
+    throw err;
+  }
 }
 
 export async function providersPair(id, endpoint, model) {
-  await runCommand("providers.pair", { id, endpoint, model });
-  await providersList().catch(() => {});
+  try {
+    await run("providers.pair", {
+      id: safeStr(id),
+      endpoint: safeStr(endpoint),
+      model: safeStr(model),
+    });
+    await providersList().catch(() => {});
+    await providersStatus().catch(() => {});
+  } catch (err) {
+    setProvidersError(String(err));
+    throw err;
+  }
 }
 
-export async function providersAttach(id, model = null) {
-  const args = { id };
-  if (model) args.model = model;
-  await runCommand("providers.attach", args);
-  await providersStatus().catch(() => {});
+export async function providersAttach(id, model = "") {
+  try {
+    await run("providers.attach", { id: safeStr(id), model: safeStr(model) });
+    await providersStatus().catch(() => {});
+  } catch (err) {
+    setProvidersError(String(err));
+    throw err;
+  }
 }
 
 export async function providersDetach() {
-  await runCommand("providers.detach", {});
-  setActiveProvider(null);
+  try {
+    await run("providers.detach", {});
+    setActiveProvider(null);
+    await providersStatus().catch(() => {});
+  } catch (err) {
+    setProvidersError(String(err));
+    throw err;
+  }
 }
 
 export async function providersRevoke(id) {
-  await runCommand("providers.revoke", { id });
-  await providersList().catch(() => {});
+  try {
+    await run("providers.revoke", { id: safeStr(id) });
+    await providersList().catch(() => {});
+    await providersStatus().catch(() => {});
+  } catch (err) {
+    setProvidersError(String(err));
+    throw err;
+  }
 }
