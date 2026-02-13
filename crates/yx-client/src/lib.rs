@@ -8,10 +8,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{atomic::AtomicBool, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use yx_protocol::{CommandError, CommandRequest, CommandResult};
+use yx_protocol::{CommandError, CommandRequest, CommandResult, Event as ProtocolEvent};
 
-const DEFAULT_PING_TIMEOUT_MS: u64 = 450;
+const DEFAULT_PING_TIMEOUT_MS: u64 = 1200;
+const RPC_PROTOCOL_VERSION: u8 = 1;
 static TRACE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -73,7 +75,11 @@ fn now_ms() -> u64 {
 }
 
 fn next_trace_id() -> String {
-    format!("yx-{}-{}", now_ms(), TRACE_COUNTER.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "yx-{}-{}",
+        now_ms(),
+        TRACE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn home_dir() -> String {
@@ -143,18 +149,19 @@ fn list_known_workspaces() -> Vec<String> {
     out
 }
 
+
+
 #[cfg(unix)]
-fn ping_socket(sock: &str, timeout: Duration) -> Result<u64> {
+fn ping_socket(sock: &str, ws: &str, timeout: Duration) -> Result<u64> {
     let trace_id = next_trace_id();
     let started = Instant::now();
-    let _ = send_command_real(sock, "status", json!({}), false, &trace_id, timeout)?;
+
+    // ping minimale, niente handshake a raffica
+    let _ = send_command_real(sock, ws, "ping", json!({}), false, &trace_id, timeout)?;
+
     Ok(started.elapsed().as_millis() as u64)
 }
 
-#[cfg(not(unix))]
-fn ping_socket(_sock: &str, _timeout: Duration) -> Result<u64> {
-    Err(anyhow!("real mode requires unix sockets"))
-}
 
 fn resolve_ws_preference() -> String {
     if let Ok(ws) = env::var("YAI_WS") {
@@ -169,7 +176,7 @@ fn resolve_ws_preference() -> String {
     for ws in candidates {
         let sock = socket_path_for_ws(&ws);
         if fs::metadata(&sock).is_ok() {
-            if ping_socket(&sock, Duration::from_millis(DEFAULT_PING_TIMEOUT_MS)).is_ok() {
+            if ping_socket(&sock, &ws, Duration::from_millis(DEFAULT_PING_TIMEOUT_MS)).is_ok() {
                 return ws;
             }
         }
@@ -185,7 +192,7 @@ pub fn workspaces_list() -> WorkspacesList {
         .map(|ws| {
             let socket_path = socket_path_for_ws(&ws);
             let exists = fs::metadata(&socket_path).is_ok();
-            let alive = exists && ping_socket(&socket_path, timeout).is_ok();
+            let alive = exists && ping_socket(&socket_path, &ws, timeout).is_ok();
             WorkspaceInfo {
                 ws,
                 socket_path,
@@ -203,7 +210,11 @@ pub fn connection_state() -> ConnectionState {
     let selected_ws = resolve_ws_preference();
     let socket_path = socket_path_for_ws(&selected_ws);
 
-    let ping = ping_socket(&socket_path, Duration::from_millis(DEFAULT_PING_TIMEOUT_MS));
+    let ping = ping_socket(
+        &socket_path,
+        &selected_ws,
+        Duration::from_millis(DEFAULT_PING_TIMEOUT_MS),
+    );
     let connected = ping.is_ok();
     let latency_ms = ping.ok();
 
@@ -216,11 +227,7 @@ pub fn connection_state() -> ConnectionState {
         configured_mode,
         resolved_mode,
         selected_ws,
-        socket_path: if connected {
-            socket_path
-        } else {
-            "(none)".to_string()
-        },
+        socket_path,
         connected,
         latency_ms,
         last_ok_ts_ms: if connected { Some(now_ms()) } else { None },
@@ -232,7 +239,7 @@ pub fn ping_selected() -> PingState {
     let socket_path = socket_path_for_ws(&selected_ws);
     let timeout = Duration::from_millis(DEFAULT_PING_TIMEOUT_MS);
 
-    match ping_socket(&socket_path, timeout) {
+    match ping_socket(&socket_path, &selected_ws, timeout) {
         Ok(latency_ms) => PingState {
             ok: true,
             latency_ms: Some(latency_ms),
@@ -248,8 +255,8 @@ pub fn ping_selected() -> PingState {
             error: Some(CommandError {
                 code: "sock_unavailable".to_string(),
                 message: error.to_string(),
-                detail: None,
-                trace_id: next_trace_id(),
+                details: None,
+                trace_id: Some(next_trace_id()),
             }),
         },
     }
@@ -258,38 +265,22 @@ pub fn ping_selected() -> PingState {
 pub fn send_command(name: &str, args: Value, arming: bool) -> CommandResult {
     let trace_id = next_trace_id();
     let state = connection_state();
+    let ts_ms = now_ms();
 
     if state.resolved_mode == Mode::Mock {
         return CommandResult {
-            trace_id,
+            id: trace_id,
+            ts_ms,
+            name: name.to_string(),
             ok: true,
-            payload: Some(mock_response(name, args)),
+            result: Some(mock_response(name, args)),
             error: None,
-        };
-    }
-
-    if !state.connected {
-        return CommandResult {
-            trace_id: trace_id.clone(),
-            ok: false,
-            payload: None,
-            error: Some(CommandError {
-                code: "sock_unavailable".to_string(),
-                message: format!(
-                    "control socket unavailable for workspace '{}'",
-                    state.selected_ws
-                ),
-                detail: Some(json!({
-                    "workspace": state.selected_ws,
-                    "socket_path": socket_path_for_ws(&state.selected_ws),
-                })),
-                trace_id,
-            }),
         };
     }
 
     match send_command_real(
         &socket_path_for_ws(&state.selected_ws),
+        &state.selected_ws,
         name,
         args,
         arming,
@@ -297,22 +288,42 @@ pub fn send_command(name: &str, args: Value, arming: bool) -> CommandResult {
         Duration::from_secs(3),
     ) {
         Ok(payload) => CommandResult {
-            trace_id,
+            id: trace_id,
+            ts_ms: now_ms(),
+            name: name.to_string(),
             ok: true,
-            payload: Some(payload),
+            result: Some(payload),
             error: None,
         },
-        Err(error) => CommandResult {
-            trace_id: trace_id.clone(),
-            ok: false,
-            payload: None,
-            error: Some(CommandError {
-                code: "command_failed".to_string(),
-                message: error.to_string(),
-                detail: None,
-                trace_id,
-            }),
-        },
+        Err(error) => {
+            let (code, message) = if !state.connected {
+                (
+                    "sock_unavailable".to_string(),
+                    format!(
+                        "control socket unavailable for workspace '{}': {}",
+                        state.selected_ws, error
+                    ),
+                )
+            } else {
+                ("command_failed".to_string(), error.to_string())
+            };
+            CommandResult {
+                id: trace_id.clone(),
+                ts_ms: now_ms(),
+                name: name.to_string(),
+                ok: false,
+                result: None,
+                error: Some(CommandError {
+                    code,
+                    message,
+                    details: Some(json!({
+                        "workspace": state.selected_ws,
+                        "socket_path": socket_path_for_ws(&state.selected_ws),
+                    })),
+                    trace_id: Some(trace_id),
+                }),
+            }
+        }
     }
 }
 
@@ -353,6 +364,7 @@ fn mock_response(name: &str, args: Value) -> Value {
 #[cfg(unix)]
 fn send_command_real(
     sock: &str,
+    ws_id: &str,
     name: &str,
     args: Value,
     arming: bool,
@@ -362,24 +374,31 @@ fn send_command_real(
     let request = CommandRequest {
         protocol_version: "v1".to_string(),
         trace_id: trace_id.to_string(),
+        ts_ms: now_ms(),
         name: name.to_string(),
         args: args.clone(),
         arming,
     };
 
     let req = map_request(&request.name, request.args.clone())?;
-    let mut stream = UnixStream::connect(sock).with_context(|| format!("connect control socket: {sock}"))?;
+    let mut stream =
+        UnixStream::connect(sock).with_context(|| format!("connect control socket: {sock}"))?;
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
 
-    let line = serde_json::to_string(&req)?;
+    let envelope = if arming {
+        json!({ "v": RPC_PROTOCOL_VERSION, "request": req, "ws_id": ws_id, "arming": true, "role": "operator" })
+    } else {
+        json!({ "v": RPC_PROTOCOL_VERSION, "request": req, "ws_id": ws_id, "arming": false })
+    };
+    let line = serde_json::to_string(&envelope)?;
     stream.write_all(line.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
 
     let mut reader = BufReader::new(stream);
     let mut seen_lines = 0u8;
-    while seen_lines < 6 {
+    while seen_lines < 8 {
         let mut resp = String::new();
         let n = reader.read_line(&mut resp)?;
         if n == 0 {
@@ -391,23 +410,15 @@ fn send_command_real(
             .with_context(|| format!("invalid json response for trace_id={trace_id}"))?;
 
         let kind = parsed
-            .get("kind")
+            .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if kind == "cmd.ack" {
-            continue;
-        }
-        if kind == "cmd.res" {
-            if let Some(payload) = parsed.get("payload") {
-                if !payload.is_null() {
-                    return Ok(payload.clone());
-                }
-            }
-            if let Some(data) = parsed.get("data") {
-                if !data.is_null() {
-                    return Ok(data.clone());
-                }
-            }
+        if kind == "error" {
+            let msg = parsed
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("daemon error");
+            return Err(anyhow!(msg.to_string()));
         }
 
         if parsed.is_null() {
@@ -436,14 +447,31 @@ fn send_command_real(
 
 fn map_request(name: &str, args: Value) -> Result<Value> {
     let v = match name {
-        "status" => json!("Status"),
-        "ping" => json!("Ping"),
-        "providers.discover" => {
-            let endpoint = args.get("endpoint").and_then(Value::as_str);
-            let model = args.get("model").and_then(Value::as_str);
-            json!({"ProvidersDiscover": {"endpoint": endpoint, "model": model}})
+        "status" => json!({ "Status": {} }),
+
+        "protocol.handshake" => {
+            let client = args.get("client").and_then(Value::as_str);
+            json!({ "ProtocolHandshake": { "client": client } })
         }
-        "providers.list" => json!("ProvidersList"),
+
+        "ping" => json!({ "Ping": {} }),
+
+        "providers.discover" => {
+            let endpoint = args
+                .get("endpoint")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            let model = args
+                .get("model")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            json!({ "ProvidersDiscover": { "endpoint": endpoint, "model": model } })
+        }
+
+        "providers.list" => json!({ "ProvidersList": {} }),
+        "providers.status" => json!({ "ProvidersStatus": {} }),
+        "providers.detach" => json!({ "ProvidersDetach": {} }),
+
         "providers.pair" => {
             let id = args
                 .get("id")
@@ -460,47 +488,62 @@ fn map_request(name: &str, args: Value) -> Result<Value> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            json!({"ProvidersPair": {"id": id, "endpoint": endpoint, "model": model}})
+            json!({ "ProvidersPair": { "id": id, "endpoint": endpoint, "model": model } })
         }
+
         "providers.attach" => {
             let id = args
                 .get("id")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let model = args.get("model").and_then(Value::as_str);
-            json!({"ProvidersAttach": {"id": id, "model": model}})
+            let model = args
+                .get("model")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            json!({ "ProvidersAttach": { "id": id, "model": model } })
         }
-        "providers.detach" => json!("ProvidersDetach"),
+
         "providers.revoke" => {
             let id = args
                 .get("id")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            json!({"ProvidersRevoke": {"id": id}})
+            json!({ "ProvidersRevoke": { "id": id } })
         }
-        "providers.status" => json!("ProvidersStatus"),
-        "events.subscribe" => json!("EventsSubscribe"),
-        "chat.sessions.list" => json!("ChatSessionsList"),
+
+        "events.subscribe" => json!({ "EventsSubscribe": {} }),
+
+        "chat.sessions.list" => json!({ "ChatSessionsList": {} }),
         "chat.session.new" => {
-            let title = args.get("title").and_then(Value::as_str);
-            json!({"ChatSessionNew": {"title": title}})
+            let title = args
+                .get("title")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            json!({ "ChatSessionNew": { "title": title } })
         }
         "chat.history" => {
-            let session_id = args.get("session_id").and_then(Value::as_str);
-            json!({"ChatHistory": {"session_id": session_id}})
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            json!({ "ChatHistory": { "session_id": session_id } })
         }
         "chat.send" => {
-            let session_id = args.get("session_id").and_then(Value::as_str);
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
             let text = args
                 .get("text")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
             let stream = args.get("stream").and_then(Value::as_bool).unwrap_or(true);
-            json!({"ChatSend": {"session_id": session_id, "text": text, "stream": stream}})
+            json!({ "ChatSend": { "session_id": session_id, "text": text, "stream": stream } })
         }
+
         "shell.exec" => {
             let cmd = args
                 .get("cmd")
@@ -516,18 +559,126 @@ fn map_request(name: &str, args: Value) -> Result<Value> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let cwd = args.get("cwd").and_then(Value::as_str);
-            json!({"ShellExec": {"cmd": cmd, "args": cmd_args, "cwd": cwd}})
+            let cwd = args
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            json!({ "ShellExec": { "cmd": cmd, "args": cmd_args, "cwd": cwd } })
         }
+
         "down" => {
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
             let shutdown = args
                 .get("shutdown")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            json!({"Down": {"force": force, "shutdown": shutdown}})
+            json!({ "Down": { "force": force, "shutdown": shutdown } })
         }
+
         _ => return Err(anyhow!("unsupported command: {name}")),
     };
+
     Ok(v)
+}
+
+#[cfg(unix)]
+fn map_event(value: &Value) -> Option<ProtocolEvent> {
+    let kind = value.get("type").and_then(Value::as_str)?;
+    if kind != "event" {
+        return None;
+    }
+    let event = value.get("event")?;
+    let topic = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let severity = event.get("level").and_then(Value::as_str).unwrap_or("info");
+    let ts_ms = event
+        .get("ts")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(now_ms);
+    let payload = json!({
+        "event_id": event.get("event_id"),
+        "ws": event.get("ws"),
+        "seq": event.get("seq"),
+        "msg": event.get("msg"),
+        "data": event.get("data"),
+        "compliance": event.get("compliance"),
+    });
+    Some(ProtocolEvent {
+        topic: topic.to_string(),
+        severity: severity.to_string(),
+        ts_ms,
+        payload,
+        trace_id: event
+            .get("event_id")
+            .and_then(Value::as_str)
+            .map(|s| s.to_string()),
+    })
+}
+
+#[cfg(unix)]
+pub fn start_event_stream<F>(on_event: F) -> Result<()>
+where
+    F: Fn(ProtocolEvent) + Send + 'static,
+{
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        while !stop_clone.load(Ordering::Relaxed) {
+            let selected_ws = resolve_ws_preference();
+            let socket_path = socket_path_for_ws(&selected_ws);
+            let stream = UnixStream::connect(&socket_path);
+            if stream.is_err() {
+                std::thread::sleep(Duration::from_millis(1200));
+                continue;
+            }
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let req = map_request("events.subscribe", json!({})).ok();
+            if req.is_none() {
+                std::thread::sleep(Duration::from_millis(1200));
+                continue;
+            }
+            let envelope = json!({ "v": RPC_PROTOCOL_VERSION, "request": req.unwrap(), "arming": false });
+            if let Ok(line) = serde_json::to_string(&envelope) {
+                let _ = stream.write_all(line.as_bytes());
+                let _ = stream.write_all(b"\n");
+                let _ = stream.flush();
+            }
+            let mut reader = BufReader::new(stream);
+            loop {
+                if stop_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                let mut resp = String::new();
+                let n = reader.read_line(&mut resp);
+                if n.is_err() || n.ok() == Some(0) {
+                    break;
+                }
+                if resolve_ws_preference() != selected_ws {
+                    break;
+                }
+                let parsed: Value = match serde_json::from_str(resp.trim_end()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(ev) = map_event(&parsed) {
+                    on_event(ev);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1200));
+        }
+    });
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn start_event_stream<F>(_on_event: F) -> Result<()>
+where
+    F: Fn(ProtocolEvent) + Send + 'static,
+{
+    Err(anyhow!("real mode requires unix sockets"))
 }

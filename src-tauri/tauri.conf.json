@@ -4,15 +4,15 @@
   "version": "0.1.0",
   "identifier": "com.yai.yx",
   "build": {
-    "frontendDist": "../ui"
+    "frontendDist": "../ui/dist"
   },
   "app": {
     "withGlobalTauri": true,
     "windows": [
       {
         "title": "YX (YAI Experience)",
-        "width": 1320,
-        "height": 840,
+        "width": 1600,
+        "height": 1000,
         "resizable": true
       }
     ],

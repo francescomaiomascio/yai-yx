@@ -45,6 +45,12 @@ fn main() {
                     let _ = handle.emit("yx:connection", payload);
                 }
             });
+            let event_handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let _ = yx_client::start_event_stream(move |event| {
+                    let _ = event_handle.emit("yx:event", event);
+                });
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
