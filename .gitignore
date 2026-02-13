@@ -1,2 +1,6 @@
 target/
 src-tauri/gen/
+
+# UI build artifacts
+ui/node_modules/
+ui/dist/
